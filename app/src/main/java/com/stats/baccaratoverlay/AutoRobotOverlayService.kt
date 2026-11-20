@@ -565,63 +565,258 @@ class AutoRobotOverlayService : Service() {
     }
 
     private fun extractOrderedBeadsAdaptive(roi: Bitmap): List<Char> {
-        val aspectCols = ((roi.width.toFloat() / roi.height.toFloat()) * GRID_ROWS).roundToInt().coerceIn(4, 24)
-        val cellW = roi.width.toFloat() / aspectCols
-        val cellH = roi.height.toFloat() / GRID_ROWS
-        val orderedBeads = mutableListOf<Char>()
+        // 1. Tự động cắt bỏ dải 3 Cầu phụ nếu khung xanh bị kéo trùm xuống dưới thanh ngăn ngang
+        val mainRoadRoi = cropOutDerivedRoads(roi)
+        if (mainRoadRoi.width < 24 || mainRoadRoi.height < 24) return emptyList()
 
-        for (col in 0 until aspectCols) {
-            for (row in 0 until GRID_ROWS) {
-                val startX = (col * cellW + cellW * 0.14f).toInt().coerceIn(0, roi.width - 1)
-                val endX = ((col + 1) * cellW - cellW * 0.14f).toInt().coerceIn(startX + 1, roi.width)
-                val startY = (row * cellH + cellH * 0.14f).toInt().coerceIn(0, roi.height - 1)
-                val endY = ((row + 1) * cellH - cellH * 0.14f).toInt().coerceIn(startY + 1, roi.height)
+        // 2. Phân biệt Bảng Cầu Đặc (chấm tròn đặc 5 cột) vs Cầu Chính Big Road (vòng tròn rỗng)
+        val isBeadPlate = detectIsSolidBeadPlate(mainRoadRoi)
 
-                var redHits = 0
-                var blueHits = 0
-                var greenHits = 0
-                var totalSamples = 0
+        return if (isBeadPlate) {
+            extractBeadPlateOrdered(mainRoadRoi)
+        } else {
+            extractBigRoadOrdered(mainRoadRoi)
+        }
+    }
 
-                var y = startY
-                while (y < endY) {
-                    var x = startX
-                    while (x < endX) {
-                        val px = roi.getPixel(x, y)
-                        val r = Color.red(px)
-                        val g = Color.green(px)
-                        val b = Color.blue(px)
-                        totalSamples++
+    /**
+     * Phát hiện thanh kẻ ngang phân cách giữa Cầu Chính (trên) và 3 Cầu phụ (dưới)
+     * nằm trong khoảng 45% - 80% chiều cao khung quét để cắt sạch vùng Cầu phụ.
+     */
+    private fun cropOutDerivedRoads(roi: Bitmap): Bitmap {
+        val w = roi.width
+        val h = roi.height
+        if (h < 60) return roi
 
-                        if (r > 130 && (r - g) > 35 && (r - b) > 35) {
-                            redHits++
-                        } else if (b > 130 && (b - r) > 35 && (b - g) > 15) {
-                            blueHits++
-                        } else if (g > 125 && (g - r) > 40 && (g - b) > 40) {
-                            greenHits++
-                        }
-                        x++
-                    }
-                    y++
-                }
+        val startScanY = (h * 0.45f).toInt()
+        val endScanY = (h * 0.80f).toInt()
+        var bestDividerY = -1
+        var lowestBrightness = 255.0
 
-                if (totalSamples > 0) {
-                    val redRatio = redHits.toFloat() / totalSamples
-                    val blueRatio = blueHits.toFloat() / totalSamples
-                    val greenRatio = greenHits.toFloat() / totalSamples
-
-                    val bead = when {
-                        redRatio >= 0.028f && redRatio >= blueRatio -> 'B'
-                        blueRatio >= 0.028f && blueRatio > redRatio -> 'P'
-                        greenRatio >= 0.14f && greenRatio > redRatio && greenRatio > blueRatio -> 'T'
-                        else -> null
-                    }
-                    if (bead != null) {
-                        orderedBeads.add(bead)
-                    }
+        for (y in startScanY until endScanY) {
+            var sumLuma = 0L
+            var darkDividerPixels = 0
+            var samples = 0
+            var x = 4
+            while (x < w - 4) {
+                val px = roi.getPixel(x, y)
+                val luma = (Color.red(px) + Color.green(px) + Color.blue(px)) / 3
+                sumLuma += luma
+                if (luma < 195) darkDividerPixels++
+                samples++
+                x += 2
+            }
+            if (samples > 0) {
+                val avgLuma = sumLuma.toDouble() / samples
+                val darkRatio = darkDividerPixels.toDouble() / samples
+                if (darkRatio >= 0.48 && avgLuma < lowestBrightness) {
+                    lowestBrightness = avgLuma
+                    bestDividerY = y
                 }
             }
         }
-        return orderedBeads
+
+        // Chỉ cắt khi phía trên thanh ngăn thực sự là nền bảng trắng sáng
+        if (bestDividerY in (h * 0.48f).toInt()..(h * 0.78f).toInt()) {
+            var upperWhiteCount = 0
+            var upperSamples = 0
+            val checkY = (bestDividerY * 0.5f).toInt().coerceAtLeast(2)
+            var x = 4
+            while (x < w - 4) {
+                val px = roi.getPixel(x, checkY)
+                if (Color.red(px) > 200 && Color.green(px) > 200 && Color.blue(px) > 200) {
+                    upperWhiteCount++
+                }
+                upperSamples++
+                x += 3
+            }
+            if (upperSamples > 0 && upperWhiteCount.toFloat() / upperSamples >= 0.45f) {
+                return Bitmap.createBitmap(roi, 0, 0, w, bestDividerY)
+            }
+        }
+        return roi
+    }
+
+    /**
+     * Phân biệt Bảng Cầu Đặc (chấm tròn tô đặc ruột) với Cầu Chính Big Road (vòng tròn rỗng ruột).
+     */
+    private fun detectIsSolidBeadPlate(roi: Bitmap): Boolean {
+        val aspect = roi.width.toFloat() / roi.height.toFloat()
+        // Bảng Cầu Đặc bên trái luôn hẹp ngang (5 cột x 6 hàng -> tỷ lệ rộng/cao ~ 0.75 - 1.15)
+        if (aspect > 1.35f) return false
+
+        val cols = (aspect * GRID_ROWS).roundToInt().coerceIn(4, 8)
+        val cellW = roi.width.toFloat() / cols
+        val cellH = roi.height.toFloat() / GRID_ROWS
+
+        var solidCenterHits = 0
+        var hollowCenterHits = 0
+
+        for (c in 0 until cols) {
+            for (r in 0 until GRID_ROWS) {
+                val cx = ((c + 0.5f) * cellW).toInt().coerceIn(0, roi.width - 1)
+                val cy = ((r + 0.5f) * cellH).toInt().coerceIn(0, roi.height - 1)
+                val px = roi.getPixel(cx, cy)
+                val red = Color.red(px)
+                val green = Color.green(px)
+                val blue = Color.blue(px)
+
+                val isColoredCenter =
+                    (red > 135 && red - green > 35 && red - blue > 35) ||
+                    (blue > 135 && blue - red > 35) ||
+                    (green > 130 && green - red > 35 && green - blue > 35)
+
+                if (isColoredCenter) {
+                    solidCenterHits++
+                } else if (red > 205 && green > 205 && blue > 205) {
+                    // Kiểm tra xem xung quanh tâm trắng có viền màu (vòng rỗng Big Road) không
+                    val bead = classifyCellBead(roi, c * cellW, r * cellH, cellW, cellH, isBigRoad = true)
+                    if (bead != null) hollowCenterHits++
+                }
+            }
+        }
+        return solidCenterHits > hollowCenterHits
+    }
+
+    /**
+     * Đọc Cầu Chính (Big Road - vòng tròn rỗng):
+     * Mỗi cột vuông 1:1 theo chiều cao 6 hàng; hỗ trợ gộp cầu bệt bẻ ngang đáy bảng (Dragon Tail).
+     */
+    private fun extractBigRoadOrdered(roi: Bitmap): List<Char> {
+        val cellH = roi.height.toFloat() / GRID_ROWS
+        // Ô Cầu Chính Big Road là hình vuông chuẩn (cellW ≈ cellH)
+        val cols = (roi.width.toFloat() / cellH).roundToInt().coerceIn(6, 26)
+        val cellW = roi.width.toFloat() / cols
+
+        val grid = Array(cols) { Array<Char?>(GRID_ROWS) { null } }
+        for (c in 0 until cols) {
+            for (r in 0 until GRID_ROWS) {
+                grid[c][r] = classifyCellBead(roi, c * cellW, r * cellH, cellW, cellH, isBigRoad = true)
+            }
+        }
+
+        val ordered = mutableListOf<Char>()
+        var c = 0
+        while (c < cols) {
+            val topBead = grid[c][0]
+            if (topBead == null) {
+                c++
+                continue
+            }
+
+            if (topBead == 'T') {
+                ordered.add('T')
+                c++
+                continue
+            }
+
+            // Đếm các tay nối tiếp thẳng xuống trong cột c
+            var streakLen = 0
+            for (r in 0 until GRID_ROWS) {
+                val cell = grid[c][r]
+                if (cell == topBead) {
+                    streakLen++
+                } else if (cell == 'T') {
+                    // Hòa nằm xen giữa không làm gãy dây cột
+                    continue
+                } else {
+                    break
+                }
+            }
+
+            // Nếu dây chạm đáy (hàng 5) và bẻ ngang sang phải ở hàng đáy của các cột kế tiếp
+            var tailColsConsumed = 0
+            if (streakLen >= GRID_ROWS) {
+                var nextC = c + 1
+                while (nextC < cols && grid[nextC][0] == null && grid[nextC][GRID_ROWS - 1] == topBead) {
+                    streakLen++
+                    tailColsConsumed++
+                    nextC++
+                }
+            }
+
+            repeat(streakLen) {
+                ordered.add(topBead)
+            }
+            c += 1 + tailColsConsumed
+        }
+        return ordered
+    }
+
+    /**
+     * Đọc Bảng Cầu Đặc (Bead Plate - chấm tròn đặc): quét từ trên xuống dưới, từ trái qua phải.
+     */
+    private fun extractBeadPlateOrdered(roi: Bitmap): List<Char> {
+        val cols = ((roi.width.toFloat() / roi.height.toFloat()) * GRID_ROWS).roundToInt().coerceIn(4, 12)
+        val cellW = roi.width.toFloat() / cols
+        val cellH = roi.height.toFloat() / GRID_ROWS
+        val ordered = mutableListOf<Char>()
+
+        for (c in 0 until cols) {
+            for (r in 0 until GRID_ROWS) {
+                val bead = classifyCellBead(roi, c * cellW, r * cellH, cellW, cellH, isBigRoad = false)
+                if (bead != null) ordered.add(bead)
+            }
+        }
+        return ordered
+    }
+
+    private fun classifyCellBead(
+        roi: Bitmap,
+        left: Float,
+        top: Float,
+        cellW: Float,
+        cellH: Float,
+        isBigRoad: Boolean
+    ): Char? {
+        val marginX = cellW * 0.16f
+        val marginY = cellH * 0.16f
+        val startX = (left + marginX).toInt().coerceIn(0, roi.width - 1)
+        val endX = (left + cellW - marginX).toInt().coerceIn(startX + 1, roi.width)
+        val startY = (top + marginY).toInt().coerceIn(0, roi.height - 1)
+        val endY = (top + cellH - marginY).toInt().coerceIn(startY + 1, roi.height)
+
+        var redHits = 0
+        var blueHits = 0
+        var greenHits = 0
+        var totalSamples = 0
+
+        var y = startY
+        while (y < endY) {
+            var x = startX
+            while (x < endX) {
+                val px = roi.getPixel(x, y)
+                val r = Color.red(px)
+                val g = Color.green(px)
+                val b = Color.blue(px)
+                totalSamples++
+
+                if (r > 135 && (r - g) > 38 && (r - b) > 38) {
+                    redHits++
+                } else if (b > 135 && (b - r) > 38 && (b - g) > 15) {
+                    blueHits++
+                } else if (g > 130 && (g - r) > 40 && (g - b) > 40) {
+                    greenHits++
+                }
+                x++
+            }
+            y++
+        }
+
+        if (totalSamples == 0) return null
+        val redRatio = redHits.toFloat() / totalSamples
+        val blueRatio = blueHits.toFloat() / totalSamples
+        val greenRatio = greenHits.toFloat() / totalSamples
+
+        // Vòng tròn rỗng Big Road có diện tích nét mảnh hơn chấm đặc Bead Plate
+        val minColorRatio = if (isBigRoad) 0.045f else 0.12f
+
+        return when {
+            redRatio >= minColorRatio && redRatio >= blueRatio -> 'B'
+            blueRatio >= minColorRatio && blueRatio > redRatio -> 'P'
+            greenRatio >= 0.16f && greenRatio > redRatio && greenRatio > blueRatio -> 'T'
+            else -> null
+        }
     }
 
     private fun processStableRoadmapSnapshot(gridBeads: List<Char>) {
