@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/scanTargetRoot"
+    android:layout_width="255dp"
+    android:layout_height="112dp"
+    android:background="@drawable/bg_scan_target">
+
+    <TextView
+        android:id="@+id/btnResizeHandle"
+        android:layout_width="24dp"
+        android:layout_height="24dp"
+        android:layout_gravity="bottom|end"
+        android:background="#CCFFD166"
+        android:gravity="center"
+        android:text="↘"
+        android:textColor="#050811"
+        android:textSize="13sp"
+        android:textStyle="bold" />
+</FrameLayout>
